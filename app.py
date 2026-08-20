@@ -1,172 +1,183 @@
-from __future__ import annotations
-
-import io
 import os
-import re
+import time
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
 import streamlit as st
-from PIL import Image
-from playwright.sync_api import sync_playwright
-from weasyprint import HTML
 
-MANUS_BASE_URL = "https://api.manus.ai"
-NTA_BASE_URL = "https://api.houjin-bangou.nta.go.jp/4"
+MANUS_API_BASE = "https://api.manus.ai"
 
-
-MANUS_SCHEMA = {
+# Manusの抽出結果をアプリで扱うための最小スキーマです。
+RESULT_SCHEMA = {
     "type": "object",
     "properties": {
+        "store_name": {"type": "string"},
+        "corporate_number": {"type": ["string", "null"]},
         "official_homepage_url": {"type": ["string", "null"]},
         "instagram_url": {"type": ["string", "null"]},
-        "menu_urls": {"type": "array", "items": {"type": "string"}},
-        "menu_text": {"type": "string"},
+        "menu_summary": {"type": "string"},
+        "pdf_url": {"type": ["string", "null"]},
         "notes": {"type": "string"},
     },
-    "required": ["official_homepage_url", "instagram_url", "menu_urls", "menu_text", "notes"],
+    "required": [
+        "store_name",
+        "corporate_number",
+        "official_homepage_url",
+        "instagram_url",
+        "menu_summary",
+        "pdf_url",
+        "notes",
+    ],
     "additionalProperties": False,
 }
 
 
-def manus_headers() -> dict[str, str]:
-    key = os.environ.get("MANUS_API_KEY")
+def api_key() -> str:
+    key = os.environ.get("MANUS_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("MANUS_API_KEY が設定されていません")
-    return {"x-manus-api-key": key, "Content-Type": "application/json"}
+        raise RuntimeError("MANUS_API_KEY が未設定です。Streamlit CloudのSecretsに設定してください。")
+    return key
 
 
-def call_manus(store_name: str, address_hint: str = "") -> dict[str, Any]:
-    prompt = f"""店舗名「{store_name}」について、公開情報だけを調査してください。所在地の手掛かりは「{address_hint}」です。
+def headers() -> dict[str, str]:
+    return {
+        "x-manus-api-key": api_key(),
+        "Content-Type": "application/json",
+    }
 
-目的は社内確認用レポートの作成です。公式ホームページ、店舗公式Instagramの公開プロフィール、公式メニュー（PDF・画像・HTML）を優先してください。
-ログイン、CAPTCHA回避、robots.txt違反、アクセス制限の回避、非公開情報の取得はしないでください。Instagramは公開URLのみを返してください。
-各URLは実際に確認できたものだけ返し、推測で補完しないでください。メニューが見つからない場合は空配列・空文字にしてください。
+
+def create_task(store_name: str, address_hint: str) -> str:
+    instruction = f"""
+店舗名「{store_name}」について、公開情報だけを調査し、最終的にPDFファイルを1つ作成してください。
+所在地の手掛かりは「{address_hint or 'なし'}」です。
+
+調査対象:
+1. 国税庁法人番号公表サイト等の信頼できる公開情報から、該当する法人番号を調べる。同名候補が複数ある場合は候補と不確実性を明記する。
+2. 店舗の公式ホームページを探す。
+3. 店舗公式の公開Instagramを探す。ログイン、非公開情報、CAPTCHA回避、アクセス制限の回避はしない。
+4. 公式メニュー表を探し、見つかった内容を要約する。
+5. 公式ホームページと公開Instagramの画面を、可能な範囲でスクリーンショットとしてPDFに含める。
+
+PDF要件:
+- 日本語の見出しを付ける。
+- 店舗名、調査日時、法人番号または候補、公式HP URL、Instagram URL、メニュー概要、各情報の出典URLを含める。
+- 「公開情報に基づく参考資料であり、情報の正確性・最新性・法人同一性を保証しない」旨を記載する。
+- PDF生成後、ダウンロード可能な直接URLを最終回答に明記する。
+
+重要:
+- 推測したURLや情報は書かず、確認できた公開情報だけを使う。
+- ログインが必要なページや非公開ページは取得しない。
+- PDFを作成できない場合は、理由を明記し、pdf_urlはnullにする。
 """
     payload = {
-        "message": {"content": prompt},
+        "message": {"content": instruction},
         "agent_profile": "standard",
-        "structured_output_schema": MANUS_SCHEMA,
+        "structured_output_schema": RESULT_SCHEMA,
     }
-    r = requests.post(f"{MANUS_BASE_URL}/v2/task.create", headers=manus_headers(), json=payload, timeout=60)
-    r.raise_for_status()
-    body = r.json()
-    if not body.get("ok", True):
-        raise RuntimeError(body)
+    response = requests.post(
+        f"{MANUS_API_BASE}/v2/task.create",
+        headers=headers(),
+        json=payload,
+        timeout=60,
+    )
+    response.raise_for_status()
+    body = response.json()
+    if body.get("ok") is False:
+        raise RuntimeError(body.get("error", body))
     task_id = body.get("task_id") or body.get("task", {}).get("id")
     if not task_id:
-        raise RuntimeError(f"Manus task_id が見つかりません: {body}")
+        raise RuntimeError(f"Manusのtask_idを取得できませんでした: {body}")
+    return task_id
 
-    for _ in range(90):
-        m = requests.get(
-            f"{MANUS_BASE_URL}/v2/task.listMessages",
-            headers={"x-manus-api-key": os.environ["MANUS_API_KEY"]},
+
+def find_structured_result(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in messages:
+        if event.get("type") != "structured_output_result":
+            continue
+        result = event.get("structured_output_result", {})
+        if result.get("success") is True:
+            return result.get("value", {})
+        if result.get("success") is False:
+            raise RuntimeError(result.get("error", "Manusの構造化出力に失敗しました"))
+    return None
+
+
+def poll_task(task_id: str, max_seconds: int = 900) -> dict[str, Any]:
+    deadline = time.time() + max_seconds
+    last_status = ""
+    while time.time() < deadline:
+        response = requests.get(
+            f"{MANUS_API_BASE}/v2/task.listMessages",
+            headers={"x-manus-api-key": api_key()},
             params={"task_id": task_id, "order": "asc"},
-            timeout=30,
+            timeout=60,
         )
-        m.raise_for_status()
-        messages = m.json().get("messages", [])
+        response.raise_for_status()
+        body = response.json()
+        messages = body.get("messages", [])
+
         for event in messages:
-            if event.get("type") == "structured_output_result":
-                result = event.get("structured_output_result", {})
-                if not result.get("success"):
-                    raise RuntimeError(result.get("error", "構造化出力に失敗しました"))
-                return result["value"]
-        import time
-        time.sleep(2)
-    raise TimeoutError("Manus APIの調査がタイムアウトしました")
+            if event.get("type") == "status_update":
+                status = event.get("status_update", {}).get("agent_status", "")
+                if status and status != last_status:
+                    last_status = status
+                    st.info(f"Manusの処理状態: {status}")
+                if status == "error":
+                    raise RuntimeError(event.get("status_update", {}).get("status_detail", "Manusタスクが失敗しました"))
+                if status == "waiting":
+                    detail = event.get("status_update", {}).get("status_detail", {})
+                    raise RuntimeError("Manusが追加操作を待機しています: " + str(detail.get("waiting_description", detail)))
+
+        result = find_structured_result(messages)
+        if result is not None:
+            return result
+        time.sleep(3)
+    raise TimeoutError("Manusの処理がタイムアウトしました。タスクはManus側で継続している可能性があります。")
 
 
-def nta_search(company_name: str) -> list[dict[str, str]]:
-    app_id = os.environ.get("NTA_APP_ID")
-    if not app_id:
-        return []
-    params = {"id": app_id, "name": company_name, "type": "12", "cnt": "20", "mode": "2"}
-    r = requests.get(f"{NTA_BASE_URL}/name", params=params, timeout=30)
-    r.raise_for_status()
-    # NTAのtype=12はCSV。仕様変更に備え、文字コードを順に試す。
-    text = r.content.decode("utf-8-sig", errors="replace")
-    rows = []
-    for line in text.splitlines():
-        cols = line.split(",")
-        if len(cols) >= 3 and re.fullmatch(r"\d{13}", cols[0].strip('"')):
-            rows.append({"corporate_number": cols[0].strip('"'), "name": cols[1].strip('"'), "address": cols[2].strip('"')})
-    return rows
+def download_pdf(pdf_url: str) -> bytes:
+    parsed = urlparse(pdf_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("Manusが返したPDF URLが不正です")
+    response = requests.get(pdf_url, timeout=120)
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "")
+    if "pdf" not in content_type.lower() and not response.content.startswith(b"%PDF"):
+        raise ValueError("指定URLのレスポンスがPDFではありません")
+    return response.content
 
 
-def safe_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    p = urlparse(value)
-    if p.scheme not in {"http", "https"} or not p.netloc:
-        return None
-    return value
+st.set_page_config(page_title="店舗情報PDF作成", page_icon="📄")
+st.title("店舗情報PDF作成")
+st.write("店舗名をManusに渡し、調査・スクリーンショット・PDF作成をManus側で実行します。")
 
-
-def screenshot_url(url: str, label: str) -> bytes | None:
-    url = safe_url(url)
-    if not url:
-        return None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1440, "height": 1100}, device_scale_factor=1)
-            page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(1500)
-            data = page.screenshot(full_page=True, type="png")
-            browser.close()
-            return data
-    except Exception as e:
-        st.warning(f"{label}のスクリーンショットを取得できませんでした: {e}")
-        return None
-
-
-def build_pdf(store_name: str, corp_rows: list[dict[str, str]], research: dict[str, Any], images: list[tuple[str, bytes]]) -> bytes:
-    def esc(s: Any) -> str:
-        return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    corp_html = "".join(f"<tr><td>{esc(x['corporate_number'])}</td><td>{esc(x['name'])}</td><td>{esc(x['address'])}</td></tr>" for x in corp_rows)
-    image_html = "".join(f"<h2>{esc(label)}</h2><img src='data:image/png;base64,{__import__('base64').b64encode(data).decode()}' />" for label, data in images)
-    menu_urls = "".join(f"<li>{esc(u)}</li>" for u in research.get("menu_urls", []))
-    html = f"""<!doctype html><html lang='ja'><head><meta charset='utf-8'><style>
-    @page {{ size: A4; margin: 16mm; }} body {{ font-family: sans-serif; color:#222; }}
-    h1 {{ font-size:24px; border-bottom:2px solid #333; padding-bottom:8px; }} h2 {{ page-break-before:always; font-size:18px; }}
-    table {{ border-collapse:collapse; width:100%; font-size:10px; }} th,td {{ border:1px solid #999; padding:5px; vertical-align:top; }}
-    th {{ background:#eee; }} img {{ max-width:100%; border:1px solid #ccc; }} .small {{ font-size:9px; color:#555; word-break:break-all; }}
-    </style></head><body>
-    <h1>{esc(store_name)} 店舗情報レポート</h1><p>作成日時: {__import__('datetime').datetime.now().isoformat(timespec='seconds')}</p>
-    <h2 style='page-break-before:auto'>法人番号候補</h2><table><tr><th>法人番号</th><th>名称</th><th>所在地</th></tr>{corp_html or '<tr><td colspan="3">候補なし（NTA_APP_ID未設定または検索結果なし）</td></tr>'}</table>
-    <h2>調査結果</h2><p>公式HP: {esc(research.get('official_homepage_url'))}</p><p>Instagram: {esc(research.get('instagram_url'))}</p><p>{esc(research.get('notes'))}</p>
-    <h3>メニューURL</h3><ul>{menu_urls or '<li>見つかりませんでした</li>'}</ul><h3>メニュー概要</h3><pre style='white-space:pre-wrap'>{esc(research.get('menu_text'))}</pre>
-    {image_html}
-    <p class='small'>注意: 本レポートは公開ページの確認結果を整理したもので、法人の同一性・情報の最新性・権利処理を保証するものではありません。掲載元URLを必ず確認してください。</p>
-    </body></html>"""
-    return HTML(string=html).write_pdf()
-
-
-st.set_page_config(page_title="店舗情報レポート", page_icon="📄", layout="centered")
-st.title("店舗情報レポート作成")
-st.caption("店舗名から公開情報を調査し、法人番号候補・公式HP・公開Instagram・メニュー情報をPDFにまとめます。")
 store_name = st.text_input("店舗名", placeholder="例：〇〇食堂")
 address_hint = st.text_input("所在地の手掛かり（任意）", placeholder="例：東京都渋谷区")
 
-if st.button("調査してPDFを作成", type="primary", disabled=not store_name):
-    with st.spinner("Manusで公開情報を調査しています…"):
-        try:
-            research = call_manus(store_name, address_hint)
-            corp_rows = nta_search(store_name)
-            images: list[tuple[str, bytes]] = []
-            for label, url in [("公式ホームページ", research.get("official_homepage_url")), ("公開Instagram", research.get("instagram_url"))]:
-                shot = screenshot_url(url, label) if url else None
-                if shot:
-                    images.append((label, shot))
-            pdf = build_pdf(store_name, corp_rows, research, images)
-            st.success("PDFを作成しました。")
-            st.json({"corporate_candidates": corp_rows, "research": research})
-            st.download_button("PDFをダウンロード", data=pdf, file_name=f"{store_name}_report.pdf", mime="application/pdf", type="primary")
-        except Exception as e:
-            st.error(f"処理に失敗しました: {e}")
+if st.button("Manusで調査してPDFを作成", type="primary", disabled=not store_name.strip()):
+    try:
+        with st.status("Manusへ依頼しています…", expanded=True) as status:
+            task_id = create_task(store_name.strip(), address_hint.strip())
+            st.write(f"タスクを作成しました: `{task_id}`")
+            result = poll_task(task_id)
+            status.update(label="調査とPDF作成が完了しました", state="complete")
 
-st.divider()
-st.caption("利用前に、対象サイトの利用規約・robots.txt・著作権・個人情報の扱いを確認してください。ログインが必要なページや非公開情報は取得しません。")
+        st.subheader("調査結果")
+        st.json(result)
+        pdf_url = result.get("pdf_url")
+        if not pdf_url:
+            st.error("ManusからPDF URLが返りませんでした。Manusの最終回答を確認してください。")
+        else:
+            pdf_bytes = download_pdf(pdf_url)
+            st.download_button(
+                "完成したPDFをダウンロード",
+                data=pdf_bytes,
+                file_name=f"{store_name.strip()}_report.pdf",
+                mime="application/pdf",
+                type="primary",
+            )
+    except Exception as error:
+        st.error(str(error))
+
+st.caption("公開情報のみを対象にしてください。サイトの利用規約、著作権、肖像権、個人情報の扱いを確認してください。")
